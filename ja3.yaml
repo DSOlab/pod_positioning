@@ -1,0 +1,92 @@
+---
+eop: data/eopc04.1962-now
+
+planetary-ephemeris:
+  bsp: data/de421.bsp
+  tls: data/latest_leapseconds.tls
+
+gravity:
+  # Filename of gravity field model in ICGEM/gfc format
+  model: data/EIGEN-GRGS.RL04.MEAN-FIELD.gfc
+  degree: 180
+  order: 180
+
+solid-earth-tide:
+  # Leave model name empty to not include effect
+  # Applicable Models: 'IERS2010'
+  model: "IERS2010"
+
+ocean-tide:
+  # Leave model name empty to not include effect
+  model: "FES14b"
+  degree: 180
+  order: 180
+  groops_file_list: data/fes2014b/FES2014b_001fileList.txt
+  data_dir: data/fes2014b
+  # Leave the following empty to not consider admittance
+  groops_doodson02_file: 
+  groops_admittance03_file:
+
+solid-earth-pole-tide:
+  # Leave model name empty to not include effect
+  # Applicable Models: 'IERS2010'
+  model: "IERS2010"
+
+ocean-pole-tide:
+  # Leave model name empty to not include effect
+  # Applicable Models: 'Desai02'
+  model: Desai02
+  coeffs: data/desaiscopolecoef.txt
+  degree: 180
+  order: 180
+
+dealiasing:
+  # Leave model name empty to not include effect
+  # model: "AOD1B RL06"
+  model:
+  # filename of first file is series ...
+  data-file: data/AOD1B_2024-04-22_X_06.asc
+  # ... and folder where subsequent files can be found (same naming convention)
+  data-dir: data
+  degree: 180
+  order: 180
+
+atmospheric-tide:
+  # Leave model name empty to not include effect
+  model: "AOD1B RL06"
+  degree: 180
+  order: 180
+  data_dir: data/aod1b_tides
+  # A GROOPS-type file list of waves
+  groops_file_list:
+  # A list of AOD1B files (per wave)
+  tide_atlas_from_aod1b:
+    k1: AOD1B_ATM_K1_06.asc
+    m2: AOD1B_ATM_M2_06.asc
+    p1: AOD1B_ATM_P1_06.asc
+    r3: AOD1B_ATM_R3_06.asc
+    s2: AOD1B_ATM_S2_06.asc
+    t2: AOD1B_ATM_T2_06.asc
+    l2: AOD1B_ATM_L2_06.asc
+    n2: AOD1B_ATM_N2_06.asc
+    r2: AOD1B_ATM_R2_06.asc
+    s1: AOD1B_ATM_S1_06.asc
+    s3: AOD1B_ATM_S3_06.asc
+    t3: AOD1B_ATM_T3_06.asc
+
+space-weather-data:
+  celestrak_csv: data/SW-All.csv
+
+atmospheric-density-model:
+  # Leave model name empty to not include atmospheric drag
+  model: "NRLMSIS-00"
+
+satellite-attitude:
+  satellite: ja3
+  cnes_sat_file: data/ja3mass.txt
+  data_file: data/qua_ja3.csv
+  # data_file:
+
+dynamic-parameters:
+  Cr: 1e0
+  Cd: 1.8e0
