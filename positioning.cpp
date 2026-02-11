@@ -11,24 +11,24 @@
 #include "eigen3/Eigen/Eigen"
 
 /* headers for integrator, repo: integrator */
-#include "orbit_integrator/integration_parameters.hpp"
+#include "integrator/integration_parameters.hpp"
 
 /* headers for DORIS Rinex, repo librnx */
-#include "rnx/doris_rinex.hpp"
+#include "librnx/doris_rinex.hpp"
 
 /* headers for DPOD Sinex */
-#include "sinex/dpod.hpp"
+#include "libsinex/dpod.hpp"
 
 /* headers for troposphere (VMF3) */
 #include "rwatmo/vmf3.hpp"
 
 /* astronomy */
-#include "iers/iau.hpp"
+#include "iers2010/iau.hpp"
 
 /* iers */
-#include "iers/earth_rotation.hpp"
-#include "iers/gravity.hpp"
-#include "iers/relativity.hpp"
+#include "iers2010/earth_rotation.hpp"
+#include "iers2010/gravity.hpp"
+#include "iers2010/relativity.hpp"
 
 /* satellites and systems */
 #include "sysnsats/doris.hpp"
@@ -40,7 +40,7 @@
 #include "sysnsats/srp.hpp"
 
 /* integrator */
-#include "orbit_integrator/dop853.hpp"
+#include "integrator/dop853.hpp"
 
 /* sp3 for initial conditions */
 #include "sp3/sp3.hpp"
@@ -50,8 +50,8 @@
 #include "geodesy/transformations.hpp"
 #include "geodesy/units.hpp"
 
-constexpr const double GM_Moon = 4902.800076e9;
-constexpr const double GM_Sun = 132712440040.944e9;
+[[maybe_unused]] constexpr const double GM_Moon = 4902.800076e9;
+[[maybe_unused]] constexpr const double GM_Sun = 132712440040.944e9;
 
 using DorisObservationType = dso::SatelliteSystemObservationType<
     dso::SATELLITE_SYSTEM::DORIS>::ObservationType;
@@ -128,10 +128,13 @@ struct BeaconObs {
     printf("\tObserved value from dtau=%.9f, Ndop=%.3f, mfrt=%.3f, fen=%.3f, "
            "Dtropo=(%.3f-%.3f)/%.9f\n",
            dtau, Ndop, mfrt, fen, next.dTropo(), this->dTropo(), dtau);
-    // TODO what is the sign for the tropospheric bias ?
-    const double Vm = -(C / fen) * (fen - mfrt - Ndop / dtau) +
-                      (next.dTropo() - this->dTropo()) / dtau; // [m/sec]
-    return -Vm;                                                // [m/sec]
+  // Tropospheric delay increases the measured range. From the phase-cycle
+  // relation cycles = (f/C)*(rho + Tropo) we get rho = (C/f)*cycles - Tropo,
+  // therefore rho_dot = (C/f)*cycles_dot - Tropo_dot. The tropospheric-rate
+  // contribution must be subtracted.
+  const double Vm = -(C / fen) * (fen - mfrt - Ndop / dtau) -
+            (next.dTropo() - this->dTropo()) / dtau; // [m/sec]
+    return Vm;                                                // [m/sec]
   }
 
   /* Equation (13) from Lemoine et al, 2010
@@ -228,6 +231,52 @@ struct Kalman {
   }
 
   void time_update(const dso::MjdEpoch &tai) noexcept { tai_ = tai; }
+
+  /* Pre-fit innovation gate (outlier detection).
+   *
+   * Computes the innovation y = z - g and its variance
+   *   S = H' P H + R   (scalar, since z is scalar)
+   * then forms the normalized innovation  |y| / sqrt(S).
+   *
+   * Returns true  if the observation PASSES the gate (keep it),
+   *         false if it is an outlier (reject it).
+   *
+   * @param[in]  z      observed value
+   * @param[in]  g      computed (predicted) value
+   * @param[in]  sigma  observation std. deviation
+   * @param[in]  H      partials vector (same size as x_)
+   * @param[in]  gate_sigma  threshold in sigma units (e.g. 3.0)
+   * @param[out] norm_innov  |y| / sqrt(S)  (for diagnostics / logging)
+   */
+  bool innovation_gate(double z, double g, double sigma,
+                       const Eigen::VectorXd &H, double gate_sigma,
+                       double &norm_innov) const noexcept {
+    const double R = sigma * sigma;
+    const double var = R + H.dot(P_ * H);       // innovation variance
+    if (!std::isfinite(var) || var <= 0.0) {
+      norm_innov = std::numeric_limits<double>::infinity();
+      return false;                            // degenerate case - reject
+    }
+    const double y = z - g;                    
+    norm_innov = std::abs(y) / std::sqrt(var);
+    return norm_innov <= gate_sigma;           // true = pass, false = outlier
+  }
+
+  /* outlier detection using prediction residual */
+  // TODO: var not used, only for debugging
+  bool prediction_residual(double z, double g, double sigma,
+                           const Eigen::VectorXd &H, double gate_sigma,
+                           double &var) const noexcept {
+    const double R = sigma * sigma;
+    var = R + H.dot(P_ * H);
+    if (!std::isfinite(var) || var <= 0.0) {
+      return false;              // degenerate case - reject
+    }
+    //TODO: optimize by resuing Kalman gain it to observation update
+    auto K = P_ * H / var;
+    auto z_minus_g = z - g;
+    return std::abs(z_minus_g - H.transpose() * (K * z_minus_g)) <= gate_sigma * std::sqrt(var);
+  }
 
   /* Observation update step (one observation at a time), with:
    * residual = z - g (scalar equation)
@@ -344,7 +393,10 @@ int main(int argc, char *argv[]) {
       const Eigen::Matrix3d R =
           dso::lvlh(dso::CartesianCrdConstView(it->cartesian_crd()));
       /* add PCO */
-      const auto rsta = it->cartesian_crd().mv + R * if_ecc;
+      const auto before = it->cartesian_crd().mv;
+      const auto rsta = before + R * if_ecc;
+      // debug: show before/after applying PCO
+      printf("[DEBUG] PCO for %s: before X=%.12f Y=%.12f Z=%.12f -> after X=%.12f Y=%.12f Z=%.12f\n", it->msite.site_code(), before(0), before(1), before(2), rsta(0), rsta(1), rsta(2));
       it->x = rsta(0);
       it->y = rsta(1);
       it->z = rsta(2);
@@ -355,6 +407,9 @@ int main(int argc, char *argv[]) {
      */
     dso::Vmf3SiteHandler vmf3(argv[5]);
     for (const auto &beacon : beaconCrdVec) {
+      // debug: print beacon Cartesian coordinates before appending to VMF3
+      const auto cc = beacon.cartesian_crd();
+      printf("[DEBUG] VMF3 append_site: %s -> X=%.3f Y=%.3f Z=%.3f\n", beacon.msite.site_code(), cc.x(), cc.y(), cc.z());
       if (vmf3.append_site(beacon.msite.site_code(), beacon.cartesian_crd())) {
         fprintf(stderr, "ERROR: Failed adding site %s to list of VMF3 sites!\n",
                 beacon.msite.site_code());
@@ -369,23 +424,13 @@ int main(int argc, char *argv[]) {
 
     /* Initial state (r, v) from Sp3 file */
     Eigen::Matrix<double, 6, 1> sat_terrestrial_state, sat_inertial_state;
-    dso::Sp3c sp3(argv[6]);
-    dso::sp3::SatelliteId sv("L27");
-    sv.set_id(sp3.sattellite_vector()[0].id);
-    dso::SvInterpolator sv_intrp(sv, sp3);
-    // if (sp3_iterator.goto_epoch(t_start.tai2tt())) {
-    //   fprintf(stderr, "ERROR Failed to get reference position from SP3\n");
-    //   return 1;
-    // }
-    // Eigen::VectorXd itrf = Eigen::Matrix<double, 6, 1>::Zero();
-    // sat_terrestrial_state(0) = sp3_iterator.data_block().state[0] * 1e3;
-    // sat_terrestrial_state(1) = sp3_iterator.data_block().state[1] * 1e3;
-    // sat_terrestrial_state(2) = sp3_iterator.data_block().state[2] * 1e3;
-    // sat_terrestrial_state(3) = sp3_iterator.data_block().state[4] * 1e-1;
-    // sat_terrestrial_state(4) = sp3_iterator.data_block().state[5] * 1e-1;
-    // sat_terrestrial_state(5) = sp3_iterator.data_block().state[6] * 1e-1;
-    // sat_inertial_state =
-    //     itrf2gcrf(dso::MjdEpoch(t_start), sat_terrestrial_state, &params);
+    dso::sp3_details::SatelliteId sv("L27");
+    {
+      dso::Sp3c sp3(argv[6]);
+      sv.set_id(sp3.sattellite_vector()[0].id);
+    }
+    dso::Sp3ForwardInterpolator<310, 10> sv_intrp(argv[6], sv);
+    dso::sp3_details::Sp3SvDataBlock blk;
 
     /* Setup the Kalman filter */
     Kalman filter((int)beaconCrdVec.size(), dso::MjdEpoch(t_start));
@@ -396,7 +441,7 @@ int main(int argc, char *argv[]) {
         ++idx;
       }
       for (int i = 0; i < (int)beaconCrdVec.size(); ++i)
-        filter.reset_rfo(i, 0.0, 1e-11);
+        filter.reset_rfo(i, 0.0, 1e-7);
       /* scaling factors initial values */
       filter.tai() = dso::MjdEpoch(t_start);
     }
@@ -463,19 +508,18 @@ int main(int argc, char *argv[]) {
       // Eigen::Vector3d Decc_inertial = Eigen::Vector3d::Zero();
       /* interpolate satellite coordinates/velocity */
       {
-        double xyz[3] = {0}, dxdydz[3];
-        if (sv_intrp.interpolate_at(tai, xyz, dxdydz)) {
+        if (sv_intrp.interpolate(tai, blk)) {
           fprintf(stderr, "Interpolator failed!\n");
           return 5;
         }
 
         Eigen::VectorXd itrf = Eigen::Matrix<double, 6, 1>::Zero();
-        sat_terrestrial_state(0) = xyz[0] * 1e3;
-        sat_terrestrial_state(1) = xyz[1] * 1e3;
-        sat_terrestrial_state(2) = xyz[2] * 1e3;
-        sat_terrestrial_state(3) = dxdydz[0] * 1e-1;
-        sat_terrestrial_state(4) = dxdydz[1] * 1e-1;
-        sat_terrestrial_state(5) = dxdydz[2] * 1e-1;
+        sat_terrestrial_state(0) = blk.state[0] * 1e3;
+        sat_terrestrial_state(1) = blk.state[1] * 1e3;
+        sat_terrestrial_state(2) = blk.state[2] * 1e3;
+        sat_terrestrial_state(3) = blk.state[4] * 1e-1;
+        sat_terrestrial_state(4) = blk.state[5] * 1e-1;
+        sat_terrestrial_state(5) = blk.state[6] * 1e-1;
         sat_inertial_state =
             itrf2gcrf(dso::MjdEpoch(tai), sat_terrestrial_state, &params);
         filter.time_update(ttai);
@@ -490,8 +534,6 @@ int main(int argc, char *argv[]) {
       /* iterate through each beacon (of current block) */
       for (const auto &bcn : bit->mbeacon_obs) {
         /* "updated" rsat in different reference points X(tai)- or X(tai)+ */
-        // const Eigen::Vector3d rsat_gcrf_com = sat_inertial_state;
-        // const Eigen::Vector3d rsat_gcrf_lif = rsat_gcrf_com;
         const Eigen::Vector3d rsat_itrf_lif =
             sat_terrestrial_state.segment<3>(0);
         /* get a pointer to the current Beacon (within rnx's m_stations) */
@@ -499,7 +541,7 @@ int main(int argc, char *argv[]) {
         /* get beacon coordinates (match vs beaconCrdVec from SINEX) */
         const auto match = std::find_if(
             beaconCrdVec.cbegin(), beaconCrdVec.cend(),
-            [&rnx = std::as_const(rnx), &bcn_ptr = std::as_const(bcn_ptr)](
+            [&bcn_ptr = std::as_const(bcn_ptr)](
                 const dso::Sinex::SiteCoordinateResults &bcrd) {
               return !std::strcmp(bcn_ptr->id(), bcrd.msite.site_code());
             });
@@ -510,10 +552,8 @@ int main(int argc, char *argv[]) {
           /* index of beacon in beaconCrdVec -- indexing for Kalman -- */
           const int bcn_idx = std::distance(beaconCrdVec.cbegin(), match);
           /* beacon coordinates in ITRF */
-          // const auto rsta_itrf = match->cartesian_crd().copy_vec3d();
           const auto rsta_itrf = filter.beacon_pos(bcn_idx);
           /* beacon coordinates in GCRF */
-          // const auto rsta_gcrf = itrf2gcrf(ttai, rsta_itrf, &params);
           /* rotation matrix R: (dX,dY,dZ) = R * (e,n,u) */
           const Eigen::Matrix3d R =
               dso::lvlh(dso::CartesianCrdConstView(rsta_itrf));
@@ -522,16 +562,31 @@ int main(int argc, char *argv[]) {
               R.transpose() * (rsat_itrf_lif - rsta_itrf);
           /* azimouth and elevation */
           const double az = std::atan2(r_enu(0), r_enu(1));
-          /* clamp against tiny roundoff excursions (e.g. 1.0000000002) cause if
-           * the asin argument is not in [-1,1], it will return Nan */
-          const double sarg = std::clamp(
-              r_enu(2) / (rsat_itrf_lif - rsta_itrf).norm(), -1e0, 1e0);
+          /* clamp against tiny roundoff excursions (e.g. 1.0000000002) and
+           * protect against degenerate geometry (zero range) or NaNs. If the
+           * geometry is invalid, skip this observation instead of aborting.
+           */
+          const double range_norm = (rsat_itrf_lif - rsta_itrf).norm();
+          if (!std::isfinite(range_norm) || range_norm <= 0.0) {
+            fprintf(stderr,
+                    "Warning: invalid/zero satellite-beacon range for site %s, skipping obs\n",
+                    bcn_ptr->id());
+            continue;
+          }
+          const double sarg_raw = r_enu(2) / range_norm;
+          const double sarg = std::clamp(sarg_raw, -1.0, 1.0);
           const double el = std::asin(sarg);
+          if (!std::isfinite(el) || el < -1e-10 || el > dso::deg2rad(90.01)) {
+            fprintf(stderr,
+                "Warning: elevation out-of-bounds or NaN (el=%.12f rad = %.6f deg) for site %s,\
+                sarg_raw=%.12f, sarg_clamped=%.12f, skipping obs\n",
+                el, dso::rad2deg(el), bcn_ptr->id(), sarg_raw, sarg);
+            continue;
+          }
           printf("Consuming new observation @beacon %s: el=%.3f, Az=%.2f\n",
                  bcn_ptr->id(), dso::rad2deg(el), dso::rad2deg(az));
-          assert(el >= -1e-10 && el <= dso::deg2rad(90.01));
           if (dso::rad2deg(el) > MIN_ELEVATION_DEG) {
-            /* elevation > cut-off angle, procced with observation */
+            /* elevation > cut-off angle, proceed with observation */
             const double L2GHz = bcn.fetchv(idx2Ghz);
             const double L400MHz = bcn.fetchv(idx400Mhz);
             /* nominal frequencies of the beacon */
@@ -619,24 +674,43 @@ int main(int argc, char *argv[]) {
                                  frt,
                                  prev->pass_nr};
                 /* sigma of observation */
-                const double sigma = .5 / std::sin(el);
+                const double sigma = .05 / std::sin(el);
                 /* observed value (obs. equation) */
                 const double observed = prev->vobserved(nowobs) * (+1.0);
                 /* computed value (obs. equation) */
                 Eigen::VectorXd H(4);
                 const double computed =
                     prev->vcomputed(nowobs, filter.rfo(bcn_idx), H);
-                /* debug print */
-                printf("Observation@%s %s observed=%+.3f computed=%.3f "
-                       "residual=%.3f\n",
-                       dso::to_char<dso::YMDFormat::YYYYMMDD,
-                                    dso::HMSFormat::HHMMSSF>(ttai, dbf),
-                       bcn_ptr->id(), observed, computed, observed - computed);
-                /* observation update */
-                Eigen::VectorXd dH = Eigen::VectorXd(filter.num_params());
-                dH.setZero();
+                /* build full-size partials vector */
+                Eigen::VectorXd dH = Eigen::VectorXd::Zero(filter.num_params());
                 dH.segment<3>(filter.index_of_pos(bcn_idx)) = H.segment<3>(0);
                 dH(filter.index_of_rfo(bcn_idx)) = H(3);
+
+                /* prediction residual (outlier detection) */
+                constexpr double gate_sigma = 3.0;
+                double var = 0.0;
+                const bool pass = filter.innovation_gate(
+                    observed, computed, sigma, dH, gate_sigma, var);
+
+                if (!pass) {
+                  printf("Observation@%s %s observed=%+.3f computed=%.3f "
+                       "res=%.20f norm_innov=%.3f %s\n",
+                       dso::to_char<dso::YMDFormat::YYYYMMDD,
+                                    dso::HMSFormat::HHMMSSF>(ttai, dbf),
+                       bcn_ptr->id(), observed, computed, observed - computed,
+                       var, "OUTLIER");
+                  continue;
+                }
+
+                /* debug print - the plot script parses the "residual" keyword*/
+                printf("Observation@%s %s observed=%+.3f computed=%.3f "
+                       "residual=%.20f norm_innov=%.3f %s\n",
+                       dso::to_char<dso::YMDFormat::YYYYMMDD,
+                                    dso::HMSFormat::HHMMSSF>(ttai, dbf),
+                       bcn_ptr->id(), observed, computed, observed - computed,
+                       var, "PASS");
+
+                /* observation update */
                 filter.observation_update(observed, computed, sigma, dH);
                 prev->replace_data(rsat_itrf_lif, rsta_itrf, ttai, az, el, Lif,
                                    L2GHz, L400MHz, fen, frt, trpres);
@@ -647,18 +721,6 @@ int main(int argc, char *argv[]) {
           } // elevation >= MIN_ELEVATION
         } // if (match == beaconCrdVec.cend())
       } // for (const auto &bcn : bit->mbeacon_obs)
-
-      /* DEBUG print */
-      //{
-      //  const Eigen::Matrix<double,6,1> pstate = gcrf2itrf(ttai,
-      //  filter.state_vector_gcrf(), &params); char buf[64]; printf("RINEX
-      //  epoch ended@%s r=(%.3f %.3f %.3f) v=(%.6f %.6f %.6f)\n",
-      //      dso::to_char<dso::YMDFormat::YYYYMMDD,
-      //          dso::HMSFormat::HHMMSSF>(
-      //          ttai, buf),
-      //      pstate(0), pstate(1), pstate(2), pstate(3), pstate(4),
-      //      pstate(5));
-      //}
 
     } /* for (auto it = rnx.begin(); it != rnx.end(); ++it) */
   } catch (std::exception &e) {
